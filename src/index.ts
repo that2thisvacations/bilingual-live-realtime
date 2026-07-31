@@ -33,6 +33,8 @@ const DEFAULT_ORIGINS = [
   "http://localhost:3000"
 ];
 
+const VERCEL_PREVIEW_ORIGIN = /^https:\/\/bilingual-live-[a-z0-9-]+-that2thisvacations-projects\.vercel\.app$/i;
+
 function allowedOrigins(env: Env): string[] {
   const configured = env.ALLOWED_ORIGINS
     ?.split(",")
@@ -44,7 +46,7 @@ function allowedOrigins(env: Env): string[] {
 function isAllowedOrigin(request: Request, env: Env): boolean {
   const origin = request.headers.get("Origin");
   if (!origin) return true;
-  return allowedOrigins(env).includes(origin);
+  return allowedOrigins(env).includes(origin) || VERCEL_PREVIEW_ORIGIN.test(origin);
 }
 
 function json(data: unknown, status = 200): Response {
