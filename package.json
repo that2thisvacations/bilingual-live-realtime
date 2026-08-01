@@ -3,14 +3,20 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "smoke:realtime": "node scripts/smoke-realtime.mjs",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20260731.1",
+    "@types/ws": "^8.18.1",
     "typescript": "^6.0.3",
-    "wrangler": "^4.68.0"
+    "wrangler": "^4.118.0",
+    "ws": "^8.21.1"
   }
 }

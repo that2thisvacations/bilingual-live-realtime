@@ -9,7 +9,9 @@ Cloudflare Worker and Durable Object WebSocket service for Bilingual Live.
 - Host publishes one caption payload
 - All viewers in the room receive it instantly
 - Latest caption is retained for newly connected viewers
-- Origin allowlist defaults to `https://bilingual-live.vercel.app` and local development
+- English, Spanish, and French captions are shared once per update, never translated per viewer
+- Viewer language presence is aggregated in memory for the active room
+- Origin allowlist defaults to `https://bilingual-live.vercel.app` and its Vercel preview deployments
 
 ## Commands
 
@@ -17,6 +19,7 @@ Cloudflare Worker and Durable Object WebSocket service for Bilingual Live.
 npm install
 npm run typecheck
 npm run dev
+npm run smoke:realtime
 npm run deploy
 ```
 
@@ -36,5 +39,7 @@ https://bilingual-live.vercel.app,http://localhost:3000
 - `GET /rooms/:sessionId`
 - `WS /rooms/:sessionId?role=host`
 - `WS /rooms/:sessionId?role=viewer`
+
+Viewers announce `en`, `es`, or `fr` with a `viewer-language` message. The host publishes one multilingual caption containing all three translations; the Worker persists and broadcasts that payload unchanged.
 
 The Vercel application remains the customer-facing frontend. This repository provides realtime transport only.

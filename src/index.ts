@@ -6,10 +6,12 @@ export interface Env {
 }
 
 type SocketRole = "host" | "viewer";
+type SupportedCaptionLanguage = "en" | "es" | "fr";
 
 type SocketAttachment = {
   role: SocketRole;
   connectedAt: string;
+  language?: SupportedCaptionLanguage;
 };
 
 type CaptionMessage = {
@@ -22,18 +24,41 @@ type CaptionMessage = {
   };
   segment: {
     id: string;
+    segmentId?: string;
+    status?: "draft" | "final";
+    sequence?: number;
     original: string;
-    translated: string;
+    translated?: string;
+    translations?: Record<SupportedCaptionLanguage, string>;
     createdAt: string;
+    finalizedAt?: string | null;
   };
 };
 
+type ViewerLanguageMessage = {
+  type: "viewer-language";
+  language: SupportedCaptionLanguage;
+};
+
+type StoredCaption = {
+  message: CaptionMessage;
+  sequence: number;
+};
+
+function readStoredCaption(stored: StoredCaption | CaptionMessage | undefined): StoredCaption | null {
+  if (!stored) return null;
+  if ("message" in stored) return stored;
+  return {
+    message: stored,
+    sequence: typeof stored.segment.sequence === "number" ? stored.segment.sequence : -1
+  };
+}
+
 const DEFAULT_ORIGINS = [
-  "https://bilingual-live.vercel.app",
-  "http://localhost:3000"
+  "https://bilingual-live.vercel.app"
 ];
 
-const VERCEL_PREVIEW_ORIGIN = /^https:\/\/bilingual-live-[a-z0-9-]+-that2thisvacations-projects\.vercel\.app$/i;
+const VERCEL_PREVIEW_HOST_SUFFIX = "-that2thisvacations-projects.vercel.app";
 
 function allowedOrigins(env: Env): string[] {
   const configured = env.ALLOWED_ORIGINS
@@ -46,7 +71,18 @@ function allowedOrigins(env: Env): string[] {
 function isAllowedOrigin(request: Request, env: Env): boolean {
   const origin = request.headers.get("Origin");
   if (!origin) return true;
-  return allowedOrigins(env).includes(origin) || VERCEL_PREVIEW_ORIGIN.test(origin);
+  if (allowedOrigins(env).includes(origin)) return true;
+
+  try {
+    const { hostname, protocol } = new URL(origin);
+    return protocol === "https:" && hostname.endsWith(VERCEL_PREVIEW_HOST_SUFFIX);
+  } catch {
+    return false;
+  }
+}
+
+function isSupportedCaptionLanguage(value: unknown): value is SupportedCaptionLanguage {
+  return value === "en" || value === "es" || value === "fr";
 }
 
 function json(data: unknown, status = 200): Response {
@@ -73,7 +109,22 @@ export default {
 
     const match = url.pathname.match(/^\/rooms\/([A-Za-z0-9_-]{4,80})$/);
     if (!match) return json({ error: "Not found" }, 404);
-    if (!isAllowedOrigin(request, env)) return json({ error: "Origin not allowed" }, 403);
+    if (!isAllowedOrigin(request, env)) {
+      return json({
+        ok: false,
+        error: "websocket_origin_not_allowed",
+        origin: request.headers.get("Origin"),
+        acceptedProductionOrigin: "https://bilingual-live.vercel.app",
+        acceptedPreviewPattern: "https://*-that2thisvacations-projects.vercel.app"
+      }, 403);
+    }
+
+    if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+      const role = url.searchParams.get("role");
+      if (role !== "host" && role !== "viewer") {
+        return json({ error: "websocket_role_required", expected: "role=host or role=viewer" }, 400);
+      }
+    }
 
     const roomId = match[1];
     const id = env.ROOMS.idFromName(roomId);
@@ -86,14 +137,18 @@ export class CaptionRoom extends DurableObject<Env> {
     const upgrade = request.headers.get("Upgrade");
     if (upgrade?.toLowerCase() !== "websocket") {
       if (request.method === "GET") {
-        const latest = await this.ctx.storage.get<CaptionMessage>("latest-caption");
-        return json({ ok: true, latest: latest ?? null, viewers: this.viewerCount() });
+        const stored = await this.ctx.storage.get<StoredCaption | CaptionMessage>("latest-caption");
+        const latest = readStoredCaption(stored);
+        return json({ ok: true, latest: latest?.message ?? null, viewers: this.viewerCount() });
       }
       return json({ error: "Expected WebSocket upgrade" }, 426);
     }
 
     const url = new URL(request.url);
-    const role = url.searchParams.get("role") === "host" ? "host" : "viewer";
+    const role = url.searchParams.get("role");
+    if (role !== "host" && role !== "viewer") {
+      return json({ error: "websocket_role_required", expected: "role=host or role=viewer" }, 400);
+    }
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
@@ -104,8 +159,9 @@ export class CaptionRoom extends DurableObject<Env> {
       connectedAt: new Date().toISOString()
     } satisfies SocketAttachment);
 
-    const latest = await this.ctx.storage.get<CaptionMessage>("latest-caption");
-    if (latest) server.send(JSON.stringify(latest));
+    const stored = await this.ctx.storage.get<StoredCaption | CaptionMessage>("latest-caption");
+    const latest = readStoredCaption(stored);
+    if (role === "viewer" && latest) server.send(JSON.stringify(latest.message));
 
     this.broadcastPresence();
     return new Response(null, { status: 101, webSocket: client });
@@ -113,18 +169,29 @@ export class CaptionRoom extends DurableObject<Env> {
 
   async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
     const attachment = socket.deserializeAttachment() as SocketAttachment | null;
-    if (attachment?.role !== "host") {
-      socket.send(JSON.stringify({ type: "error", error: "Viewer sockets cannot publish captions." }));
+
+    const text = typeof message === "string" ? message : new TextDecoder().decode(message);
+    let parsed: CaptionMessage | ViewerLanguageMessage;
+
+    try {
+      parsed = JSON.parse(text) as CaptionMessage | ViewerLanguageMessage;
+    } catch {
+      socket.send(JSON.stringify({ type: "error", error: "Invalid JSON message." }));
       return;
     }
 
-    const text = typeof message === "string" ? message : new TextDecoder().decode(message);
-    let parsed: CaptionMessage;
+    if (attachment?.role === "viewer" && parsed.type === "viewer-language") {
+      if (!isSupportedCaptionLanguage(parsed.language)) {
+        socket.send(JSON.stringify({ type: "error", error: "Unsupported caption language." }));
+        return;
+      }
+      socket.serializeAttachment({ ...attachment, language: parsed.language } satisfies SocketAttachment);
+      this.broadcastPresence();
+      return;
+    }
 
-    try {
-      parsed = JSON.parse(text) as CaptionMessage;
-    } catch {
-      socket.send(JSON.stringify({ type: "error", error: "Invalid JSON message." }));
+    if (attachment?.role !== "host") {
+      socket.send(JSON.stringify({ type: "error", error: "Viewer sockets cannot publish captions." }));
       return;
     }
 
@@ -133,7 +200,15 @@ export class CaptionRoom extends DurableObject<Env> {
       return;
     }
 
-    await this.ctx.storage.put("latest-caption", parsed);
+    const stored = readStoredCaption(
+      await this.ctx.storage.get<StoredCaption | CaptionMessage>("latest-caption")
+    );
+    const sequence = typeof parsed.segment.sequence === "number"
+      ? parsed.segment.sequence
+      : (stored?.sequence ?? -1) + 1;
+    if (sequence <= (stored?.sequence ?? -1)) return;
+
+    await this.ctx.storage.put("latest-caption", { message: parsed, sequence } satisfies StoredCaption);
     const outgoing = JSON.stringify(parsed);
 
     for (const peer of this.ctx.getWebSockets()) {
@@ -148,15 +223,13 @@ export class CaptionRoom extends DurableObject<Env> {
   }
 
   webSocketClose(socket: WebSocket, code: number, reason: string): void {
-    try {
-      socket.close(code, reason);
-    } finally {
-      this.broadcastPresence();
-    }
+    void code;
+    void reason;
+    this.broadcastPresence(socket);
   }
 
-  webSocketError(): void {
-    this.broadcastPresence();
+  webSocketError(socket: WebSocket): void {
+    this.broadcastPresence(socket);
   }
 
   private viewerCount(): number {
@@ -166,16 +239,28 @@ export class CaptionRoom extends DurableObject<Env> {
     }).length;
   }
 
-  private broadcastPresence(): void {
-    const message = JSON.stringify({
-      type: "presence",
-      viewers: this.viewerCount(),
-      connected: this.ctx.getWebSockets().length
+  private broadcastPresence(exclude?: WebSocket): void {
+    const sockets = this.ctx.getWebSockets().filter((socket) => socket !== exclude);
+    const viewerLanguages = sockets.flatMap((socket) => {
+      const attachment = socket.deserializeAttachment() as SocketAttachment | null;
+      return attachment?.role === "viewer" ? [attachment.language] : [];
     });
+    const languages = viewerLanguages.reduce<Record<SupportedCaptionLanguage, number>>((counts, language) => {
+      if (language) counts[language] += 1;
+      return counts;
+    }, { en: 0, es: 0, fr: 0 });
 
-    for (const socket of this.ctx.getWebSockets()) {
+    const presence = JSON.stringify({
+      type: "presence",
+      viewers: viewerLanguages.length,
+      connected: sockets.length
+    });
+    const languagePresence = JSON.stringify({ type: "language-presence", languages });
+
+    for (const socket of sockets) {
       try {
-        socket.send(message);
+        socket.send(presence);
+        socket.send(languagePresence);
       } catch {
         // Ignore sockets closing between enumeration and send.
       }
